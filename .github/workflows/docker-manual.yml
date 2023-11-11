@@ -1,6 +1,8 @@
 ---
-name: build stylua
-run-name: build stylua-${{inputs.version}}
+name: docker-manual
+run-name: build ${{inputs.version}} via docker
+env:
+  upstream: JohnnyMorganz/StyLua
 
 on:
   workflow_dispatch:
@@ -12,20 +14,32 @@ on:
         type: string
 
 permissions: write-all
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {target: x86_64-unknown-linux-gnu, name: linux-amd64}
-          - {target: aarch64-unknown-linux-gnu, name: linux-arm64}
+        target: [aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu]
+
     name: Build ${{matrix.target}}
     runs-on: ubuntu-latest
+    env:
+      CARGO: cargo
+      RUST_BACKTRACE: 1
     steps:
       - name: Checkout
         uses: actions/checkout@main
+
+      - name: Checkout upstream
+        uses: actions/checkout@main
+        with:
+          repository: ${{env.upstream}}
+          ref: v${{inputs.version}}
+          path: src
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@master
@@ -39,17 +53,17 @@ jobs:
           platforms: linux/amd64
           push: false
           build-args: |
-            VERSION=${{inputs.version}}
             TARGET=${{matrix.target}}
-          outputs: type=local,dest=./
+          outputs: type=local,dest=./dist
 
       - name: Upload ${{matrix.target}}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |-
-          tar -czf "stylua-v${{inputs.version}}-${{matrix.name}}.tar.gz" stylua
+          mv dist/stylua stylua
+          tar -czf "stylua-v${{inputs.version}}-${{matrix.target}}.tar.gz" stylua
           # create release if not exist
           gh release create "v${{inputs.version}}" --notes "Release stylua v${{inputs.version}}" --title "v${{inputs.version}}" --repo "${{github.repository}}" || true
           # delete the asset if exists
-          gh release delete-asset "v${{inputs.version}}" "stylua-v${{inputs.version}}-${{matrix.name}}.tar.gz" --yes --repo "${{github.repository}}" || true
-          gh release upload "v${{inputs.version}}" "./stylua-v${{inputs.version}}-${{matrix.name}}.tar.gz" --repo "${{github.repository}}"
+          gh release delete-asset "v${{inputs.version}}" "stylua-v${{inputs.version}}-${{matrix.target}}.tar.gz" --yes --repo "${{github.repository}}" || true
+          gh release upload "v${{inputs.version}}" "./stylua-v${{inputs.version}}-${{matrix.target}}.tar.gz" --repo "${{github.repository}}"

@@ -1,0 +1,149 @@
+---
+name: docker-nightly
+run-name: nightly build via docker
+env:
+  upstream: JohnnyMorganz/StyLua
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/docker-nightly.yml
+  schedule:
+    - cron: 45 23 * * *
+
+permissions: write-all
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.trigger-check.outputs.action }}
+      remote_sha: ${{ steps.meta.outputs.remote_sha }}
+    steps:
+      - uses: actions/checkout@main
+      - name: set meta info
+        id: meta
+        run: |
+          echo "remote_sha=$(git ls-remote https://github.com/${{env.upstream}}.git HEAD | awk '{ print $1}')" >> $GITHUB_OUTPUT
+
+      - name: check if we need to trigger a build
+        id: trigger-check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REMOTE_SHA: ${{ steps.meta.outputs.remote_sha }}
+        run: |
+          if ! gh api /repos/${{github.repository}}/branches/manifest-docker > /dev/null 2>&1; then
+          echo "branch manifest not found. trigger a build"
+          echo "action=trigger" >> "$GITHUB_OUTPUT"
+          else
+          last_sha=$(curl -sSLf https://raw.githubusercontent.com/${{github.repository}}/manifest/manifest.json | jq -r '.remote_sha')
+          if [ "$last_sha" != "$REMOTE_SHA" ]; then
+          echo "remote_sha changed. trigger a build"
+          echo "action=trigger" >> "$GITHUB_OUTPUT"
+          else
+          echo "remote_sha not changed. skip"
+          echo "action=skip" >> "$GITHUB_OUTPUT"
+          fi
+          fi
+
+  build:
+    needs: filter
+    if: needs.filter.outputs.action == 'trigger'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu]
+
+    name: Build ${{matrix.target}}
+    runs-on: ubuntu-latest
+    env:
+      CARGO: cargo
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Checkout upstream
+        uses: actions/checkout@main
+        with:
+          repository: ${{env.upstream}}
+          ref: ${{ needs.filter.outputs.remote_sha }}
+          path: src
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@master
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@master
+      - name: Build
+        uses: docker/build-push-action@master
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            TARGET=${{matrix.target}}
+          outputs: type=local,dest=./dist
+
+      - name: Set full and short ref
+        env:
+          FULL_REF: ${{ needs.filter.outputs.remote_sha }}
+        run: |
+          echo "short_ref=${FULL_REF:0:7}" >> $GITHUB_ENV
+          echo "full_ref=$FULL_REF" >> $GITHUB_ENV
+
+      - name: Upload ${{matrix.target}}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |-
+          mv dist/stylua stylua
+          tar -czf "stylua-${{matrix.target}}-${{env.short_ref}}.tar.gz" stylua
+          # create release if not exist
+          gh release create "${{env.short_ref}}" --prerelease --notes "Nightly build based on https://github.com/${{env.upstream}}/tree/${{env.full_ref}}" --title "${{env.short_ref}}" --repo "${{github.repository}}" || true
+          # delete the asset if exists
+          gh release delete-asset "${{env.short_ref}}" "stylua-${{matrix.target}}-${{env.short_ref}}.tar.gz" --yes --repo "${{github.repository}}" || true
+          gh release upload "${{env.short_ref}}" "./stylua-${{matrix.target}}-${{env.short_ref}}.tar.gz" --repo "${{github.repository}}"
+          # upload as nightly
+          mv "stylua-${{matrix.target}}-${{env.short_ref}}.tar.gz" "stylua-${{matrix.target}}.tar.gz"
+          gh release create "nightly" --prerelease --notes "Nightly build" --title "nightly" --repo "${{github.repository}}" || true
+          gh release edit "nightly" --prerelease --notes "Nightly build based on https://github.com/${{env.upstream}}/tree/${{env.full_ref}}" --title "nightly" --repo "${{github.repository}}" || true
+          gh release delete-asset "nightly" "stylua-${{matrix.target}}.tar.gz" --yes --repo "${{github.repository}}" || true
+          gh release upload "nightly" "./stylua-${{matrix.target}}.tar.gz" --repo "${{github.repository}}"
+
+  manifest:
+    runs-on: ubuntu-latest
+    needs: [filter, build]
+    name: push manifest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@main
+
+      - name: set date
+        run: |
+          echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
+
+      - name: generate manifest
+        env:
+          remote_sha: ${{ needs.filter.outputs.remote_sha }}
+        run: |-
+          mkdir public
+          cat <<EOF > public/manifest.json
+          {
+            "date": "${{ env.date }}",
+            "remote_sha": "${{ env.remote_sha }}"
+          }
+          EOF
+          cat public/manifest.json
+
+      - name: Deploy
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: manifest-docker
+          folder: ./public
+          single-commit: true
+          commit-message: ${{ github.event.head_commit.message }}

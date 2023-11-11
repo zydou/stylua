@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@main
         with:
           repository: ${{env.upstream}}
-          ref: ${{inputs.version}}
+          ref: v${{inputs.version}}
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@master
